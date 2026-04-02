@@ -21,7 +21,7 @@ pip install pandas
 ## install
 ```
 conda create -n trainer python==3.10
-source trainer flymyai
+source activate trainer
 pip install -r requirements.txt
 pip install -r requirements.txt
 pip uninstall diffusers -y
