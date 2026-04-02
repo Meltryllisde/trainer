@@ -1,0 +1,4 @@
+# SAM3 HTTP通信所需的额外依赖
+flask>=2.0.0      # HTTP服务器框架
+requests>=2.25.0  # HTTP客户端
+Werkzeug>=2.0.0   # Flask依赖
