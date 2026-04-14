@@ -151,3 +151,16 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
+
+# Dataset extracted from zip
+dataset_ready/
+
+# LoRA checkpoints
+lora_saves_*/
+
+# Tool config
+.omc/
+
+# Logs
+train_output.log
+sam3_server.log
