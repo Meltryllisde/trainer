@@ -34,7 +34,7 @@ def initialize_model():
     if model is None:
         logger.info("初始化SAM3模型...")
         model = build_sam3_image_model()
-        processor = Sam3Processor(model=model, confidence_threshold=0.8)
+        processor = Sam3Processor(model=model, confidence_threshold=0.5)
         logger.info("SAM3模型初始化完成")
 
 
@@ -67,6 +67,24 @@ def process_image_with_sam(image_path, obj):
 
 def calculate_iou(mask1, mask2):
     """计算两个掩膜的IoU"""
+    if hasattr(mask1, 'cpu'):
+        mask1 = mask1.cpu().numpy()
+    if hasattr(mask2, 'cpu'):
+        mask2 = mask2.cpu().numpy()
+    # Handle empty masks (no detection)
+    if mask1.size == 0 or mask2.size == 0:
+        return 0.0
+    # Ensure 2D masks
+    while mask1.ndim > 2:
+        mask1 = mask1[0]
+    while mask2.ndim > 2:
+        mask2 = mask2[0]
+    # Resize masks to same shape if needed
+    if mask1.shape != mask2.shape:
+        from PIL import Image as PILImage
+        h, w = max(mask1.shape[0], mask2.shape[0]), max(mask1.shape[1], mask2.shape[1])
+        mask1 = np.array(PILImage.fromarray(mask1.astype(np.uint8)).resize((w, h), PILImage.NEAREST))
+        mask2 = np.array(PILImage.fromarray(mask2.astype(np.uint8)).resize((w, h), PILImage.NEAREST))
     intersection = np.logical_and(mask1, mask2).sum()
     union = np.logical_or(mask1, mask2).sum()
     if union == 0:
@@ -139,12 +157,18 @@ def process_endpoint():
         
         # 计算IoU
         iou_score = calculate_iou(masks1, masks2)
-        
+
+        def get_shape(m):
+            if hasattr(m, 'cpu'):
+                return list(m.shape)
+            return list(m.shape) if hasattr(m, 'shape') else []
+        m1_shape = get_shape(masks1)
+        m2_shape = get_shape(masks2)
         return jsonify({
             'success': True,
             'iou': iou_score,
-            'mask1_shape': list(masks1.shape),
-            'mask2_shape': list(masks2.shape)
+            'mask1_shape': m1_shape,
+            'mask2_shape': m2_shape
         })
     
     except Exception as e:

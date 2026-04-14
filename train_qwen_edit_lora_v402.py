@@ -214,7 +214,7 @@ def main():
     text_encoding_pipeline = QwenImageEditPipeline.from_pretrained(
         args.pretrained_model_name_or_path, transformer=None, vae=None, torch_dtype=weight_dtype
     )
-    text_encoding_pipeline.to(accelerator.device)
+    # Keep on CPU, will move to GPU on demand in training loop
     cached_text_embeddings = None
     txt_cache_dir = None
 
@@ -222,17 +222,13 @@ def main():
         args.pretrained_model_name_or_path,
         subfolder="vae",
     )
-    vae.to(accelerator.device, dtype=weight_dtype)
+    # Keep on CPU, will move to GPU on demand in training loop
     cached_image_embeddings = None
     img_cache_dir = None
     cached_image_embeddings_control = None
-    # del text_encoding_pipeline
-    gc.collect()
-    #del vae
-    gc.collect()
     flux_transformer = QwenImageTransformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path,
-        subfolder="transformer",    )
+        subfolder="transformer", torch_dtype=weight_dtype)
     if args.quantize:
         torch_dtype = weight_dtype
         device = accelerator.device
@@ -245,9 +241,7 @@ def main():
         flux_transformer.to(device, dtype=torch_dtype)
         quantize(flux_transformer, weights=qfloat8)
         freeze(flux_transformer)
-        #quantize(flux_transformer, weights=qint8, activations=qint8)
-        #freeze(flux_transformer)
-        
+
     lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.rank,
@@ -341,6 +335,11 @@ def main():
     vae_scale_factor = 2 ** len(vae.temperal_downsample)
     reward_baseline = 0.0
     fst_flag = True
+    # Per-step loss log file
+    loss_log_path = getattr(args, 'loss_log_path', 'loss_log.csv')
+    if accelerator.is_main_process:
+        with open(loss_log_path, 'w') as f:
+            f.write("step,loss\n")
     for epoch in range(1):
         train_loss = 0.0
         for step, batch in enumerate(dataloader):
@@ -358,6 +357,8 @@ def main():
             imgs = batch['target_image_path']
             img_names = batch['image_stem']
             with torch.no_grad():
+                # Move text_encoding_pipeline to GPU for encoding
+                text_encoding_pipeline.to(accelerator.device)
                 # txt processing
                 for control_img, prompt in zip(control_imgs, prompts):
                     control_img_pli = Image.open(control_img).convert('RGB')
@@ -371,7 +372,10 @@ def main():
                         num_images_per_prompt=1,
                         max_sequence_length=1024,
                     )
-                    cached_text_embeddings.append({'prompt_embeds': prompt_embeds[0].to('cpu'), 'prompt_embeds_mask': prompt_embeds_mask[0].to('cpu')})#################
+                    cached_text_embeddings.append({
+                        'prompt_embeds': prompt_embeds[0].to('cpu'),
+                        'prompt_embeds_mask': prompt_embeds_mask[0].to('cpu') if prompt_embeds_mask is not None else None
+                    })
                     prompt_embeds_empty, prompt_embeds_mask_empty = text_encoding_pipeline.encode_prompt(
                         image=prompt_image,
                         prompt=[' '],
@@ -379,14 +383,21 @@ def main():
                         num_images_per_prompt=1,
                         max_sequence_length=1024,
                     )
-                    cached_text_empty_embeddings.append({'prompt_embeds': prompt_embeds_empty[0].to('cpu'), 'prompt_embeds_mask': prompt_embeds_mask_empty[0].to('cpu')})#################
+                    cached_text_empty_embeddings.append({
+                        'prompt_embeds': prompt_embeds_empty[0].to('cpu'),
+                        'prompt_embeds_mask': prompt_embeds_mask_empty[0].to('cpu') if prompt_embeds_mask_empty is not None else None
+                    })
+                # Offload text_encoding_pipeline, load vae
+                text_encoding_pipeline.to('cpu')
+                torch.cuda.empty_cache()
+                vae.to(accelerator.device, dtype=weight_dtype)
 
                 for img in imgs:
                     img_pli = Image.open(img).convert('RGB')
                     calculated_width, calculated_height, _ = calculate_dimensions(1024 * 1024, img_pli.size[0] / img_pli.size[1])
                     img_lat = text_encoding_pipeline.image_processor.resize(img_pli, calculated_height, calculated_width)
                     img_lat = torch.from_numpy((np.array(img_lat) / 127.5) - 1)
-                    pixel_values = img_lat.permute(2, 0, 1).unsqueeze(2)
+                    pixel_values = img_lat.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # (1, C, 1, H, W)
                     pixel_values = pixel_values.to(dtype=weight_dtype).to(accelerator.device)
                     pixel_latents = vae.encode(pixel_values).latent_dist.sample().to('cpu')[0]
                     cached_image_embeddings.append(pixel_latents)#################
@@ -395,14 +406,21 @@ def main():
                     calculated_width, calculated_height, _ = calculate_dimensions(1024 * 1024, control_img_pli.size[0] / control_img_pli.size[1])
                     control_lat = text_encoding_pipeline.image_processor.resize(control_img_pli, calculated_height, calculated_width)
                     control_lat = torch.from_numpy((np.array(control_lat) / 127.5) - 1)
-                    pixel_values_control = control_lat.permute(2, 0, 1).unsqueeze(2)
+                    pixel_values_control = control_lat.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # (1, C, 1, H, W)
                     pixel_values_control = pixel_values_control.to(dtype=weight_dtype).to(accelerator.device)
                     pixel_latents_control = vae.encode(pixel_values_control).latent_dist.sample().to('cpu')[0]
                     cached_image_embeddings_control.append(pixel_latents_control)#################
+                # Offload vae back to CPU
+                vae.to('cpu')
+                torch.cuda.empty_cache()
 
             with accelerator.accumulate(flux_transformer):
                 prompt_embeds = torch.stack([e['prompt_embeds'] for e in cached_text_embeddings]).to(dtype=weight_dtype).to(accelerator.device)
-                prompt_embeds_mask = torch.stack([e['prompt_embeds_mask'] for e in cached_text_embeddings]).to(dtype=torch.int32).to(accelerator.device)
+                if cached_text_embeddings[0]['prompt_embeds_mask'] is not None:
+                    prompt_embeds_mask = torch.stack([e['prompt_embeds_mask'] for e in cached_text_embeddings]).to(dtype=torch.int32).to(accelerator.device)
+                else:
+                    # All tokens are valid when mask is None
+                    prompt_embeds_mask = torch.ones(prompt_embeds.shape[:2], dtype=torch.int32, device=accelerator.device)
                 control_img = torch.stack(cached_image_embeddings_control).to(dtype=weight_dtype).to(accelerator.device)
                 img = torch.stack(cached_image_embeddings).to(dtype=weight_dtype).to(accelerator.device)
                 with torch.no_grad():
@@ -484,33 +502,42 @@ def main():
                     1,
                 )
                 # ===============Reward from IoU==================
-                with torch.no_grad():
-                    eps = 1e-5
-                    pred_x0 = (noisy_model_input - sigmas * model_pred.permute(0, 2, 1, 3, 4)) / torch.clamp(1.0 - sigmas, min=eps)
-                    pred_x0 = pred_x0 / latents_std + latents_mean
+                use_iou = getattr(args, 'use_iou_reward', True)
+                if use_iou:
+                    with torch.no_grad():
+                        eps = 1e-5
+                        pred_x0 = (noisy_model_input - sigmas * model_pred.permute(0, 2, 1, 3, 4)) / torch.clamp(1.0 - sigmas, min=eps)
+                        pred_x0 = pred_x0 / latents_std + latents_mean
 
-                    decoded = vae.decode(pred_x0.to(dtype = weight_dtype)).sample
-                    decoded = (decoded / 2 + 0.5).clamp(0, 1) * 255.0
+                        vae.to(accelerator.device, dtype=weight_dtype)
+                        # pred_x0 shape: (B, C, F, H, W) - ensure correct dim order for vae
+                        if pred_x0.shape[1] == 1 and pred_x0.shape[2] > 1:
+                            pred_x0 = pred_x0.permute(0, 2, 1, 3, 4)  # swap C and F
+                        decoded = vae.decode(pred_x0.to(dtype = weight_dtype)).sample
+                        decoded = (decoded / 2 + 0.5).clamp(0, 1) * 255.0
+                        # Squeeze frame dimension: (B, C, F, H, W) -> (B, C, H, W)
+                        if decoded.dim() == 5:
+                            decoded = decoded.squeeze(2)
 
-                    rs = []
-                    for i in range(bsz):
-                        pred_pil = tensor_to_pil_rgb_uint8(decoded[i])
-                        obj = "robotic arm"
-                        tgt_img_pli = Image.open(imgs[i]).convert('RGB')
-                        if fst_flag:
-                            pred_pil.save("pred_pil.png")
-                            tgt_img_pli.save("tgt_img_pli.png")
-                            fst_flag = False
-                        r = iou_reward_with_sam(pred_pil, tgt_img_pli[i], obj)
-                        if r > 0.9:
-                            r = 1.0
-                        rs.append(r)
-                    rs_tensor = torch.tensor(rs, device=loss.device, dtype=loss.dtype)
-                    reward_mean = float(rs_tensor.mean().item())
-                    adv = reward_mean
-                    # reward_baseline = baseline_momentum * reward_baseline + (1.0 - baseline_momentum) * reward_mean
-                    # adv = torch.relu(rs_tensor - reward_baseline).detach()
-                loss = loss + (1.0 - adv) * 0.05 * loss
+                        rs = []
+                        for i in range(bsz):
+                            pred_pil = tensor_to_pil_rgb_uint8(decoded[i])
+                            obj = "robotic arm"
+                            tgt_img_pli = Image.open(imgs[i]).convert('RGB')
+                            if fst_flag:
+                                pred_pil.save("pred_pil.png")
+                                tgt_img_pli.save("tgt_img_pli.png")
+                                fst_flag = False
+                            r = iou_reward_with_sam(pred_pil, tgt_img_pli, obj)
+                            if r > 0.9:
+                                r = 1.0
+                            rs.append(r)
+                        rs_tensor = torch.tensor(rs, device=loss.device, dtype=loss.dtype)
+                        reward_mean = float(rs_tensor.mean().item())
+                        adv = reward_mean
+                        vae.to('cpu')
+                        torch.cuda.empty_cache()
+                    loss = loss + (1.0 - adv) * 0.05 * loss
                 # ===============Reward from IoU==================
                 loss = loss.mean()
                 # Gather the losses across all processes for logging (if we use distributed training).
@@ -530,6 +557,9 @@ def main():
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
+                if accelerator.is_main_process:
+                    with open(loss_log_path, 'a') as f:
+                        f.write(f"{global_step},{train_loss}\n")
                 train_loss = 0.0
 
                 if global_step % args.checkpointing_steps == 0:

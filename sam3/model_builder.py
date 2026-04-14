@@ -560,12 +560,11 @@ def build_sam3_image_model(
     bpe_path=None,
     device="cuda" if torch.cuda.is_available() else "cpu",
     eval_mode=True,
-    #checkpoint_path=None,
-    load_from_HF=False,
+    checkpoint_path=None,
+    load_from_HF=True,
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
-    checkpoint_path="/storage/v-jinpewang/lab_folder/zc_workspace/code/sam3/sam3.pt"
 ):
     """
     Build SAM3 image model
@@ -642,7 +641,7 @@ def build_sam3_image_model(
 
 
 def download_ckpt_from_hf():
-    SAM3_MODEL_ID = "facebook/sam3"
+    SAM3_MODEL_ID = "pankjkkkkkk/sam3_pt"
     SAM3_CKPT_NAME = "sam3.pt"
     SAM3_CFG_NAME = "config.json"
     _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
